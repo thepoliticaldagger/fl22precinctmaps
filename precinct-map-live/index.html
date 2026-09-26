@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Precinct Map — Demographics / Early Voting / Elections</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<style>
+  html, body, #map { height: 100%; margin: 0; }
+  .legend {
+    background: white; padding: 10px 12px; border-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.4); font: 13px/1.4 sans-serif; color: #222;
+    display: none;
+  }
+  .legend.active { display: block; }
+  .legend h4 { margin: 0 0 6px; font-size: 13px; }
+  .legend-row { display: flex; align-items: center; margin: 2px 0; }
+  .legend-swatch { width: 14px; height: 14px; margin-right: 6px; flex: none; border: 1px solid rgba(0,0,0,.2); }
+  .legend-gradient { height: 12px; width: 140px; border-radius: 2px; margin-bottom: 4px; }
+  .legend-scale-labels { display: flex; justify-content: space-between; width: 140px; font-size: 11px; color: #555; }
+  #status {
+    position: absolute; top: 10px; left: 50px; z-index: 1000;
+    background: white; padding: 6px 10px; border-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.3); font: 12px sans-serif; color: #333;
+  }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="status">Loading data…</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+// ==============================================================
+// CONFIG — county code must match the code used in each live URL
+// ==============================================================
+const TURNOUT_SOURCES = {
+  CLL: { name: "Collier",    url: "https://s3.amazonaws.com/turnoutquickview.electionsfl.org/data/FL/CLL/132/data.json" },
+  HEN: { name: "Hendry",     url: "https://s3.amazonaws.com/turnoutquickview.electionsfl.org/data/FL/HEN/112/data.json" },
+  PAL: { name: "Palm Beach", url: "https://s3.amazonaws.com/turnoutquickview.electionsfl.org/data/FL/PAL/578/data.json" }
+  // add more counties here as more live feeds become available
+};
+
+const STATIC_FILES = {
+  demographics: "data/demographics.geojson",
+  election2020: "data/election_2020.geojson",
+  election2024: "data/election_2024.geojson"
+};
+
+const RACE_LABELS = ["White", "Hispanic", "Black", "Asian", "Native American"];
+const DEMO_COLORS = {
+  White: "#FF7F00", Hispanic: "#4DAF4A", Black: "#377EB8",
+  Asian: "#E41A1C", "Native American": "#984EA3"
+};
+
+function normalizePrecinct(x) {
+  if (x === null || x === undefined) return null;
+  let s = String(x).trim();
+  s = s.replace(/\.[0-9]+$/, "");
+  if (/^[0-9]+$/.test(s)) s = String(parseInt(s, 10));
+  return s;
+}
+
+// ------------------------------------------------------------
+// Election color function — direct port of the R breakpoints
+// ------------------------------------------------------------
+function electionColor(demPct, repPct) {
+  if (demPct == null || repPct == null || isNaN(demPct) || isNaN(repPct)) return "#CCCCCC";
+  if (demPct > repPct) {
+    if (demPct >= 70) return "#002B84";
+    if (demPct >= 60) return "#0645B4";
+    if (demPct >= 50) return "#1666CB";
+    if (demPct >= 40) return "#4389E3";
+  } else if (repPct > demPct) {
+    if (repPct >= 70) return "#800000";
+    if (repPct >= 60) return "#AA0000";
+    if (repPct >= 50) return "#D40000";
+    if (repPct >= 40) return "#CC2F4A";
+  }
+  return "#CCCCCC";
+}
+
+// ------------------------------------------------------------
+// Simple YlGnBu-style ramp for % mail ballots returned
+// ------------------------------------------------------------
+const YLGNBU = ["#ffffcc", "#c7e9b4", "#7fcdbb", "#41b6c4", "#2c7fb8", "#253494"];
+function turnoutColor(pct, min, max) {
+  if (pct == null || isNaN(pct)) return "#CCCCCC";
+  if (max <= min) return YLGNBU[0];
+  const t = Math.max(0, Math.min(1, (pct - min) / (max - min)));
+  const idx = t * (YLGNBU.length - 1);
+  const i0 = Math.floor(idx), i1 = Math.min(YLGNBU.length - 1, i0 + 1);
+  const f = idx - i0;
+  return lerpColor(YLGNBU[i0], YLGNBU[i1], f);
+}
+function lerpColor(a, b, f) {
+  const pa = hexToRgb(a), pb = hexToRgb(b);
+  const r = Math.round(pa[0] + (pb[0]-pa[0])*f);
+  const g = Math.round(pa[1] + (pb[1]-pa[1])*f);
+  const bl = Math.round(pa[2] + (pb[2]-pa[2])*f);
+  return `rgb(${r},${g},${bl})`;
+}
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+
+// ==============================================================
+// MAP SETUP
+// ==============================================================
+const map = L.map("map");
+L.tileLayer(
+  "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+  { attribution: "Esri World Gray Canvas", maxZoom: 19 }
+).addTo(map);
+
+const statusEl = document.getElementById("status");
+
+async function loadJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("Failed to fetch " + url + " (status " + res.status + ")");
+  return res.json();
+}
+
+(async function init() {
+  let demo, e2020, e2024;
+  try {
+    [demo, e2020, e2024] = await Promise.all([
+      loadJSON(STATIC_FILES.demographics),
+      loadJSON(STATIC_FILES.election2020),
+      loadJSON(STATIC_FILES.election2024)
+    ]);
+  } catch (err) {
+    statusEl.textContent = "Error loading static layers — check the data/ folder is present.";
+    console.error(err);
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // Fetch live turnout feeds (each may fail independently)
+  // ------------------------------------------------------------
+  const turnoutLookup = {}; // { CLL: { "132": {eligible, mail} }, ... }
+  await Promise.all(Object.entries(TURNOUT_SOURCES).map(async ([code, cfg]) => {
+    try {
+      const data = await loadJSON(cfg.url);
+      const byPrecinct = {};
+      const pt = (data.Turnout && data.Turnout.PrecinctType) || {};
+      Object.entries(pt).forEach(([precId, rec]) => {
+        const norm = normalizePrecinct(precId);
+        const mail = (rec.BallotTypeTotals && rec.BallotTypeTotals.Mail) || 0;
+        const eligible = rec.EligibleVoters || 0;
+        if (!byPrecinct[norm]) byPrecinct[norm] = { eligible: 0, mail: 0 };
+        byPrecinct[norm].eligible += eligible;
+        byPrecinct[norm].mail += mail;
+      });
+      turnoutLookup[code] = { byPrecinct, lastUpdated: data.Summary && data.Summary.LastUpdatedTime };
+    } catch (err) {
+      console.warn("Could not load live turnout for", code, err);
+      turnoutLookup[code] = { byPrecinct: {}, lastUpdated: null };
+    }
+  }));
+
+  // ------------------------------------------------------------
+  // Merge turnout onto the demographics features
+  // ------------------------------------------------------------
+  let turnoutMin = Infinity, turnoutMax = -Infinity;
+  let matched = 0, unmatchedNoCounty = 0, unmatchedNoTurnout = 0;
+  demo.features.forEach(f => {
+    const p = f.properties;
+    const county = p.county_code;
+    const norm = p.precinct_norm || normalizePrecinct(p.PRECINCT_ID);
+    if (!county) { unmatchedNoCounty++; }
+    const src = county && turnoutLookup[county] ? turnoutLookup[county].byPrecinct[norm] : null;
+    if (src && src.eligible > 0) {
+      p.EligibleVoters = src.eligible;
+      p.MailBallots = src.mail;
+      p.pct_returned = (src.mail / src.eligible) * 100;
+      turnoutMin = Math.min(turnoutMin, p.pct_returned);
+      turnoutMax = Math.max(turnoutMax, p.pct_returned);
+      matched++;
+    } else {
+      p.EligibleVoters = null;
+      p.MailBallots = null;
+      p.pct_returned = null;
+      if (county) unmatchedNoTurnout++;
+    }
+  });
+  if (!isFinite(turnoutMin)) { turnoutMin = 0; turnoutMax = 100; }
+  console.log(`Turnout match summary — matched: ${matched}, no county_code: ${unmatchedNoCounty}, county ok but no turnout row: ${unmatchedNoTurnout}`);
+
+  // ------------------------------------------------------------
+  // Popups
+  // ------------------------------------------------------------
+  function demoPopup(p) {
+    return `<strong>Precinct:</strong> ${p.PRECINCT_ID}<br>
+      <strong>Plurality group:</strong> ${p.plurality_group ?? "—"}<br>
+      <strong>White:</strong> ${fmt(p.white_pct)}%<br>
+      <strong>Hispanic:</strong> ${fmt(p.hisp_pct)}%<br>
+      <strong>Black:</strong> ${fmt(p.black_pct)}%<br>
+      <strong>Asian:</strong> ${fmt(p.asian_pct)}%<br>
+      <strong>Native American:</strong> ${fmt(p.nat_pct)}%`;
+  }
+  function turnoutPopup(p) {
+    return `<strong>Precinct:</strong> ${p.PRECINCT_ID}<br>
+      <strong>County:</strong> ${p.COUNTY ?? "—"}<br>
+      <strong>Eligible Voters:</strong> ${p.EligibleVoters ?? "no data"}<br>
+      <strong>Mail Ballots Returned:</strong> ${p.MailBallots ?? "no data"}<br>
+      <strong>% Returned:</strong> ${p.pct_returned != null ? fmt(p.pct_returned, 2) + "%" : "no data"}`;
+  }
+  function electionPopup(p, precCol, demLabel, demCol, repCol, totalCol) {
+    return `<strong>Precinct:</strong> ${p[precCol]}<br>
+      <strong>${demLabel}:</strong> ${fmt(p[demCol])}%<br>
+      <strong>Trump:</strong> ${fmt(p[repCol])}%<br>
+      <strong>Total votes:</strong> ${p[totalCol] ?? "—"}`;
+  }
+  function fmt(v, digits) { return v == null || isNaN(v) ? "—" : Number(v).toFixed(digits ?? 1); }
+
+  // ------------------------------------------------------------
+  // Layers
+  // ------------------------------------------------------------
+  const baseStyle = { color: "#444444", weight: 1, fillOpacity: 0.7 };
+
+  const demoLayer = L.geoJSON(demo, {
+    style: f => ({ ...baseStyle, fillColor: DEMO_COLORS[f.properties.plurality_group] || "#CCCCCC" }),
+    onEachFeature: (f, layer) => layer.bindPopup(demoPopup(f.properties))
+  });
+
+  const turnoutLayer = L.geoJSON(demo, {
+    style: f => ({ ...baseStyle, fillColor: turnoutColor(f.properties.pct_returned, turnoutMin, turnoutMax) }),
+    onEachFeature: (f, layer) => layer.bindPopup(turnoutPopup(f.properties))
+  });
+
+  const layer2020 = L.geoJSON(e2020, {
+    style: f => ({ ...baseStyle, fillColor: electionColor(f.properties.dem_pct_2020, f.properties.rep_pct_2020) }),
+    onEachFeature: (f, layer) => layer.bindPopup(
+      electionPopup(f.properties, "PRECINCT", "Biden", "dem_pct_2020", "rep_pct_2020", "Total_2020")
+    )
+  });
+
+  const layer2024 = L.geoJSON(e2024, {
+    style: f => ({ ...baseStyle, fillColor: electionColor(f.properties.dem_pct_2024, f.properties.rep_pct_2024) }),
+    onEachFeature: (f, layer) => layer.bindPopup(
+      electionPopup(f.properties, "PREC_ID", "Harris", "dem_pct_2024", "rep_pct_2024", "Total_2024")
+    )
+  });
+
+  const baseLayers = {
+    "Demographics": demoLayer,
+    "Early/Mail Voting": turnoutLayer,
+    "2020 Election": layer2020,
+    "2024 Election": layer2024
+  };
+
+  demoLayer.addTo(map);
+  map.fitBounds(demoLayer.getBounds());
+  L.control.layers(baseLayers, null, { collapsed: false, position: "topright" }).addTo(map);
+
+  // ------------------------------------------------------------
+  // Legends (one per layer, toggled on baselayerchange)
+  // ------------------------------------------------------------
+  const legendDemo = L.control({ position: "bottomright" });
+  legendDemo.onAdd = () => {
+    const div = L.DomUtil.create("div", "legend active");
+    div.dataset.key = "Demographics";
+    div.innerHTML = "<h4>Plurality VAP Group</h4>" + RACE_LABELS.map(r =>
+      `<div class="legend-row"><span class="legend-swatch" style="background:${DEMO_COLORS[r]}"></span>${r}</div>`
+    ).join("");
+    return div;
+  };
+  legendDemo.addTo(map);
+
+  const legendTurnout = L.control({ position: "bottomright" });
+  legendTurnout.onAdd = () => {
+    const div = L.DomUtil.create("div", "legend");
+    div.dataset.key = "Early/Mail Voting";
+    div.innerHTML = `<h4>% Mail Ballots Returned</h4>
+      <div class="legend-gradient" style="background:linear-gradient(to right, ${YLGNBU.join(",")})"></div>
+      <div class="legend-scale-labels"><span>${fmt(turnoutMin)}%</span><span>${fmt(turnoutMax)}%</span></div>`;
+    return div;
+  };
+  legendTurnout.addTo(map);
+
+  const electionLegendHTML = `<h4>Winning Candidate %</h4>
+    ${[
+      ["#4389E3","Democratic winner: 40–49.9%"], ["#1666CB","Democratic winner: 50–59.9%"],
+      ["#0645B4","Democratic winner: 60–69.9%"], ["#002B84","Democratic winner: 70%+"],
+      ["#CC2F4A","Republican winner: 40–49.9%"], ["#D40000","Republican winner: 50–59.9%"],
+      ["#AA0000","Republican winner: 60–69.9%"], ["#800000","Republican winner: 70%+"]
+    ].map(([c,l]) => `<div class="legend-row"><span class="legend-swatch" style="background:${c}"></span>${l}</div>`).join("")}`;
+
+  const legend2020 = L.control({ position: "bottomright" });
+  legend2020.onAdd = () => {
+    const div = L.DomUtil.create("div", "legend");
+    div.dataset.key = "2020 Election";
+    div.innerHTML = electionLegendHTML;
+    return div;
+  };
+  legend2020.addTo(map);
+
+  const legend2024 = L.control({ position: "bottomright" });
+  legend2024.onAdd = () => {
+    const div = L.DomUtil.create("div", "legend");
+    div.dataset.key = "2024 Election";
+    div.innerHTML = electionLegendHTML;
+    return div;
+  };
+  legend2024.addTo(map);
+
+  map.on("baselayerchange", e => {
+    document.querySelectorAll(".legend").forEach(el => {
+      el.classList.toggle("active", el.dataset.key === e.name);
+    });
+  });
+
+  const updatedTimes = Object.entries(turnoutLookup)
+    .filter(([, v]) => v.lastUpdated)
+    .map(([code, v]) => `${TURNOUT_SOURCES[code].name}: ${new Date(v.lastUpdated).toLocaleString()}`);
+  statusEl.textContent = updatedTimes.length
+    ? "Turnout last updated — " + updatedTimes.join(" | ")
+    : "Live turnout unavailable — showing static layers only.";
+})();
+</script>
+</body>
+</html>
